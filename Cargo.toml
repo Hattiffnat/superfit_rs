@@ -1,0 +1,15 @@
+
+[package]
+name = "superfit_rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nalgebra = "0.35"
+parry3d = "=0.29.0"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+bitcode = { version = "0.6.9", features = ["default", "serde"] }
+serde_json = "1.0"
+burn = { version = "0.22", features = ["flex"] }
+# bincode = "2.0.1"
