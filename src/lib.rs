@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use nalgebra::{Point3, Vector3};
+use nalgebra::Point3;
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -11,10 +11,13 @@ use crate::mesh::{normalize_to_unit_cube, validate_mesh};
 mod assembly;
 
 mod mesh;
+mod sdf;
 
 #[derive(Clone, Debug)]
 pub struct MeshToAssemblyOptions {
     pub grid_res: usize,
+    /// Optional VHACD voxel resolution. Defaults to min(grid_res, 128) to limit cost.
+    pub decomp_res: Option<usize>,
     pub padding: f64,
 }
 
@@ -22,6 +25,7 @@ impl Default for MeshToAssemblyOptions {
     fn default() -> Self {
         Self {
             grid_res: 64,
+            decomp_res: None,
             padding: 0.01,
         }
     }
@@ -33,6 +37,13 @@ pub fn mesh_to_assembly<P: AsRef<Path>>(
     opts: MeshToAssemblyOptions,
 ) -> Result<()> {
     anyhow::ensure!(opts.grid_res >= 2, "grid resolution must be at least 2");
+    let decomp_res = opts.decomp_res.unwrap_or(opts.grid_res.min(128));
+    anyhow::ensure!(
+        decomp_res >= 2,
+        "decomposition resolution must be at least 2"
+    );
+    let vhacd_resolution = u32::try_from(decomp_res)
+        .context("decomposition resolution exceeds VHACD's supported integer range")?;
     anyhow::ensure!(
         opts.padding.is_finite() && opts.padding >= 0.0,
         "padding must be finite and nonnegative"
@@ -43,13 +54,26 @@ pub fn mesh_to_assembly<P: AsRef<Path>>(
 
     fs::create_dir_all(&out_dir)?;
     let bbox = compute_bbox(&mesh, opts.padding);
-    let assembly = assembly::decompose_and_fit(&mesh, out_dir.as_ref())?;
+    let assembly = assembly::decompose_and_fit(&mesh, out_dir.as_ref(), vhacd_resolution)?;
     let assembly_path = out_dir.as_ref().join("assembly.json");
     let assembly_file = File::create(&assembly_path)
         .with_context(|| format!("create {}", assembly_path.display()))?;
     serde_json::to_writer_pretty(assembly_file, &assembly).context("write assembly json")?;
 
-    let (sdf, dims) = compute_sdf_grid(&mesh, &bbox, opts.grid_res)?;
+    let (sdf, dims) = match sdf::compute_gpu(&mesh, &bbox, opts.grid_res) {
+        Ok(Some(result)) => {
+            println!("SDF grid computed on GPU");
+            result
+        }
+        Ok(None) => {
+            println!("No GPU adapter available; computing SDF on CPU");
+            sdf::compute_cpu(&mesh, &bbox, opts.grid_res)?
+        }
+        Err(error) => {
+            eprintln!("GPU SDF unavailable ({error:#}); falling back to CPU");
+            sdf::compute_cpu(&mesh, &bbox, opts.grid_res)?
+        }
+    };
     // save sdf as binary via bincode
     let sdf_path = out_dir.as_ref().join("sdf.bin");
     let mut f = File::create(&sdf_path)?;
@@ -152,149 +176,6 @@ fn compute_bbox(mesh: &mesh::TriMesh, padding: f64) -> (Point3<f64>, Point3<f64>
     let diag = max - min;
     let pad = diag * padding;
     (min - pad, max + pad)
-}
-
-fn point_triangle_distance(
-    p: &Point3<f64>,
-    a: &Point3<f64>,
-    b: &Point3<f64>,
-    c: &Point3<f64>,
-) -> f64 {
-    // using algorithm by David Eberly / real-time collision detection
-    let ab = b - a;
-    let ac = c - a;
-    let ap = p - a;
-    let d1 = ab.dot(&ap);
-    let d2 = ac.dot(&ap);
-    if d1 <= 0.0 && d2 <= 0.0 {
-        return (p - a).norm();
-    }
-    let bp = p - b;
-    let d3 = ab.dot(&bp);
-    let d4 = ac.dot(&bp);
-    if d3 >= 0.0 && d4 <= d3 {
-        return (p - b).norm();
-    }
-    let vc = d1 * d4 - d3 * d2;
-    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
-        let v = d1 / (d1 - d3);
-        let proj = a + ab * v;
-        return (p - proj).norm();
-    }
-    let cp = p - c;
-    let d5 = ab.dot(&cp);
-    let d6 = ac.dot(&cp);
-    if d6 >= 0.0 && d5 <= d6 {
-        return (p - c).norm();
-    }
-    let vb = d5 * d2 - d1 * d6;
-    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
-        let w = d2 / (d2 - d6);
-        let proj = a + ac * w;
-        return (p - proj).norm();
-    }
-    let va = d3 * d6 - d5 * d4;
-    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
-        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        let proj = b + (c - b) * w;
-        return (p - proj).norm();
-    }
-    // inside face region
-    let denom = 1.0 / (va + vb + vc);
-    let v = vb * denom;
-    let w = vc * denom;
-    let proj = a + ab * v + ac * w;
-    (p - proj).norm()
-}
-
-fn ray_intersects_triangle(
-    orig: &Point3<f64>,
-    dir: &Vector3<f64>,
-    a: &Point3<f64>,
-    b: &Point3<f64>,
-    c: &Point3<f64>,
-) -> Option<f64> {
-    // Moller–Trumbore
-    let eps = 1e-9;
-    let edge1 = b - a;
-    let edge2 = c - a;
-    let h = dir.cross(&edge2);
-    let det = edge1.dot(&h);
-    if det.abs() < eps {
-        return None;
-    }
-    let inv_det = 1.0 / det;
-    let s = orig - a;
-    let u = s.dot(&h) * inv_det;
-    if u < 0.0 || u > 1.0 {
-        return None;
-    }
-    let q = s.cross(&edge1);
-    let v = dir.dot(&q) * inv_det;
-    if v < 0.0 || u + v > 1.0 {
-        return None;
-    }
-    let t = edge2.dot(&q) * inv_det;
-    if t > eps { Some(t) } else { None }
-}
-
-fn compute_sdf_grid(
-    mesh: &mesh::TriMesh,
-    bbox: &(Point3<f64>, Point3<f64>),
-    grid_res: usize,
-) -> Result<(Vec<f32>, (usize, usize, usize))> {
-    let (min, max) = bbox;
-    let nx = grid_res;
-    let ny = grid_res;
-    let nz = grid_res;
-    let sx = (max.x - min.x) / (nx as f64 - 1.0);
-    let sy = (max.y - min.y) / (ny as f64 - 1.0);
-    let sz = (max.z - min.z) / (nz as f64 - 1.0);
-    let mut sdf = vec![f32::MAX; nx * ny * nz];
-
-    for iz in 0..nz {
-        for iy in 0..ny {
-            for ix in 0..nx {
-                let idx = iz * ny * nx + iy * nx + ix;
-                let p = Point3::new(
-                    min.x + ix as f64 * sx,
-                    min.y + iy as f64 * sy,
-                    min.z + iz as f64 * sz,
-                );
-                // compute closest distance
-                let mut min_d = f64::INFINITY;
-                for t in &mesh.tris {
-                    let d = point_triangle_distance(
-                        &p,
-                        &mesh.verts[t[0]],
-                        &mesh.verts[t[1]],
-                        &mesh.verts[t[2]],
-                    );
-                    if d < min_d {
-                        min_d = d;
-                    }
-                }
-                // sign via raycast along +X
-                let dir = Vector3::new(1.0, 0.0, 0.0);
-                let mut hits = 0usize;
-                for t in &mesh.tris {
-                    if let Some(_t) = ray_intersects_triangle(
-                        &p,
-                        &dir,
-                        &mesh.verts[t[0]],
-                        &mesh.verts[t[1]],
-                        &mesh.verts[t[2]],
-                    ) {
-                        hits += 1;
-                    }
-                }
-                let sign = if hits % 2 == 1 { -1.0 } else { 1.0 };
-                sdf[idx] = (min_d * sign) as f32;
-            }
-        }
-    }
-
-    Ok((sdf, (nx, ny, nz)))
 }
 
 #[cfg(test)]

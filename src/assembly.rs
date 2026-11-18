@@ -23,10 +23,15 @@ pub struct Assembly {
     pub method: &'static str,
     pub primitive: &'static str,
     pub combine_operator: &'static str,
+    pub decomposition_resolution: u32,
     pub parts: Vec<Ellipsoid>,
 }
 
-pub fn decompose_and_fit(mesh: &TriMesh, out_dir: &Path) -> Result<Assembly> {
+pub fn decompose_and_fit(
+    mesh: &TriMesh,
+    out_dir: &Path,
+    voxel_resolution: u32,
+) -> Result<Assembly> {
     ensure!(!mesh.verts.is_empty(), "cannot decompose an empty mesh");
     ensure!(
         !mesh.tris.is_empty(),
@@ -44,8 +49,13 @@ pub fn decompose_and_fit(mesh: &TriMesh, out_dir: &Path) -> Result<Assembly> {
         .map(|t| [t[0] as u32, t[1] as u32, t[2] as u32])
         .collect();
 
-    let decomposition = VHACD::decompose(&VHACDParameters::default(), &vertices, &indices, true);
-    let hulls = decomposition.compute_exact_convex_hulls(&vertices, &indices);
+    let params = VHACDParameters {
+        resolution: voxel_resolution,
+        ..VHACDParameters::default()
+    };
+    let decomposition = VHACD::decompose(&params, &vertices, &indices, false);
+    // Use voxel-derived hulls so their surface sampling/detail follows VHACD resolution.
+    let hulls = decomposition.compute_convex_hulls(1);
     ensure!(!hulls.is_empty(), "VHACD produced no convex parts");
 
     let mut parts = Vec::with_capacity(hulls.len());
@@ -73,6 +83,7 @@ pub fn decompose_and_fit(mesh: &TriMesh, out_dir: &Path) -> Result<Assembly> {
         method: "parry-vhacd + burn-flex-autodiff",
         primitive: "axis-aligned ellipsoid",
         combine_operator: "union",
+        decomposition_resolution: voxel_resolution,
         parts,
     })
 }

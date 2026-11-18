@@ -27,6 +27,14 @@ fn main() -> Result<()> {
                     .parse()
                     .context("invalid --grid-res")?;
             }
+            "--decomp-res" => {
+                opts.decomp_res = Some(
+                    args.next()
+                        .context("--decomp-res requires an integer")?
+                        .parse()
+                        .context("invalid --decomp-res")?,
+                );
+            }
             "--padding" => {
                 opts.padding = args
                     .next()
@@ -36,7 +44,7 @@ fn main() -> Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: mesh_to_assembly_rs --input mesh.obj --output DIR [--grid-res N] [--padding N]"
+                    "Usage: mesh_to_assembly_rs --input mesh.obj --output DIR [--grid-res N] [--decomp-res N] [--padding N]\n  --grid-res N    SDF grid resolution (default: 64)\n  --decomp-res N  VHACD resolution (default: min(grid-res, 128))"
                 );
                 return Ok(());
             }
