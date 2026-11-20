@@ -6,7 +6,7 @@ use parry3d::{
     transformation::vhacd::{VHACD, VHACDParameters},
 };
 use serde::Serialize;
-use std::{fs::File, io::Write, path::Path};
+use std::{fs, fs::File, io::Write, path::Path};
 
 use crate::mesh::TriMesh;
 
@@ -24,6 +24,8 @@ pub struct Assembly {
     pub primitive: &'static str,
     pub combine_operator: &'static str,
     pub decomposition_resolution: u32,
+    pub decomposition_concavity: f32,
+    pub max_convex_parts: u32,
     pub parts: Vec<Ellipsoid>,
 }
 
@@ -31,11 +33,21 @@ pub fn decompose_and_fit(
     mesh: &TriMesh,
     out_dir: &Path,
     voxel_resolution: u32,
+    concavity: f32,
+    max_convex_parts: u32,
 ) -> Result<Assembly> {
     ensure!(!mesh.verts.is_empty(), "cannot decompose an empty mesh");
     ensure!(
         !mesh.tris.is_empty(),
         "cannot decompose a mesh without triangles"
+    );
+    ensure!(
+        concavity.is_finite() && (0.0..=1.0).contains(&concavity),
+        "VHACD concavity must be finite and between 0 and 1"
+    );
+    ensure!(
+        max_convex_parts > 0,
+        "maximum convex parts must be positive"
     );
 
     let vertices: Vec<Vector> = mesh
@@ -51,6 +63,8 @@ pub fn decompose_and_fit(
 
     let params = VHACDParameters {
         resolution: voxel_resolution,
+        concavity,
+        max_convex_hulls: max_convex_parts,
         ..VHACDParameters::default()
     };
     let decomposition = VHACD::decompose(&params, &vertices, &indices, false);
@@ -58,6 +72,7 @@ pub fn decompose_and_fit(
     let hulls = decomposition.compute_convex_hulls(1);
     ensure!(!hulls.is_empty(), "VHACD produced no convex parts");
 
+    remove_old_hull_files(out_dir)?;
     let mut parts = Vec::with_capacity(hulls.len());
     for (part_index, (hull_vertices, hull_faces)) in hulls.iter().enumerate() {
         if hull_vertices.is_empty() {
@@ -78,14 +93,41 @@ pub fn decompose_and_fit(
         });
     }
     ensure!(!parts.is_empty(), "VHACD produced no nonempty convex parts");
+    println!("VHACD produced {} convex parts", parts.len());
 
     Ok(Assembly {
         method: "parry-vhacd + burn-flex-autodiff",
         primitive: "axis-aligned ellipsoid",
         combine_operator: "union",
         decomposition_resolution: voxel_resolution,
+        decomposition_concavity: concavity,
+        max_convex_parts,
         parts,
     })
+}
+
+fn remove_old_hull_files(out_dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(out_dir).with_context(|| format!("read {}", out_dir.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(index) = name
+            .strip_prefix("part_")
+            .and_then(|name| name.strip_suffix(".obj"))
+        else {
+            continue;
+        };
+        if !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()) {
+            fs::remove_file(&path)
+                .with_context(|| format!("remove stale hull {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn fit_ellipsoid(points: &[[f32; 3]]) -> Result<([f32; 3], [f32; 3])> {
@@ -181,6 +223,24 @@ fn save_hull_obj(points: &[[f32; 3]], faces: &[[u32; 3]], path: &Path) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_hull_cleanup_only_removes_generated_hull_names() {
+        let out_dir = std::env::temp_dir().join(format!("superfit-hulls-{}", std::process::id()));
+        fs::create_dir_all(&out_dir).unwrap();
+        fs::write(out_dir.join("part_000.obj"), "old hull").unwrap();
+        fs::write(out_dir.join("part_12.obj"), "old hull").unwrap();
+        fs::write(out_dir.join("part_notes.obj"), "keep").unwrap();
+        fs::write(out_dir.join("part_2.txt"), "keep").unwrap();
+
+        remove_old_hull_files(&out_dir).unwrap();
+
+        assert!(!out_dir.join("part_000.obj").exists());
+        assert!(!out_dir.join("part_12.obj").exists());
+        assert!(out_dir.join("part_notes.obj").exists());
+        assert!(out_dir.join("part_2.txt").exists());
+        fs::remove_dir_all(out_dir).unwrap();
+    }
 
     #[test]
     fn ellipsoid_fit_returns_finite_positive_radii() {

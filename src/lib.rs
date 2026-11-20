@@ -18,6 +18,10 @@ pub struct MeshToAssemblyOptions {
     pub grid_res: usize,
     /// Optional VHACD voxel resolution. Defaults to min(grid_res, 128) to limit cost.
     pub decomp_res: Option<usize>,
+    /// Maximum VHACD concavity. Lower values encourage more convex parts.
+    pub decomp_concavity: f32,
+    /// Upper bound on the number of VHACD convex parts.
+    pub max_parts: u32,
     pub padding: f64,
 }
 
@@ -26,6 +30,8 @@ impl Default for MeshToAssemblyOptions {
         Self {
             grid_res: 64,
             decomp_res: None,
+            decomp_concavity: 0.002,
+            max_parts: 128,
             padding: 0.01,
         }
     }
@@ -45,6 +51,11 @@ pub fn mesh_to_assembly<P: AsRef<Path>>(
     let vhacd_resolution = u32::try_from(decomp_res)
         .context("decomposition resolution exceeds VHACD's supported integer range")?;
     anyhow::ensure!(
+        opts.decomp_concavity.is_finite() && (0.0..=1.0).contains(&opts.decomp_concavity),
+        "decomposition concavity must be finite and between 0 and 1"
+    );
+    anyhow::ensure!(opts.max_parts > 0, "maximum parts must be positive");
+    anyhow::ensure!(
         opts.padding.is_finite() && opts.padding >= 0.0,
         "padding must be finite and nonnegative"
     );
@@ -54,7 +65,13 @@ pub fn mesh_to_assembly<P: AsRef<Path>>(
 
     fs::create_dir_all(&out_dir)?;
     let bbox = compute_bbox(&mesh, opts.padding);
-    let assembly = assembly::decompose_and_fit(&mesh, out_dir.as_ref(), vhacd_resolution)?;
+    let assembly = assembly::decompose_and_fit(
+        &mesh,
+        out_dir.as_ref(),
+        vhacd_resolution,
+        opts.decomp_concavity,
+        opts.max_parts,
+    )?;
     let assembly_path = out_dir.as_ref().join("assembly.json");
     let assembly_file = File::create(&assembly_path)
         .with_context(|| format!("create {}", assembly_path.display()))?;

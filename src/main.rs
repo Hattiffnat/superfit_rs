@@ -35,6 +35,20 @@ fn main() -> Result<()> {
                         .context("invalid --decomp-res")?,
                 );
             }
+            "--decomp-concavity" => {
+                opts.decomp_concavity = args
+                    .next()
+                    .context("--decomp-concavity requires a number")?
+                    .parse()
+                    .context("invalid --decomp-concavity")?;
+            }
+            "--max-parts" => {
+                opts.max_parts = args
+                    .next()
+                    .context("--max-parts requires an integer")?
+                    .parse()
+                    .context("invalid --max-parts")?;
+            }
             "--padding" => {
                 opts.padding = args
                     .next()
@@ -44,7 +58,7 @@ fn main() -> Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: mesh_to_assembly_rs --input mesh.obj --output DIR [--grid-res N] [--decomp-res N] [--padding N]\n  --grid-res N    SDF grid resolution (default: 64)\n  --decomp-res N  VHACD resolution (default: min(grid-res, 128))"
+                    "Usage: mesh_to_assembly_rs --input mesh.obj --output DIR [--grid-res N] [--decomp-res N] [--decomp-concavity X] [--max-parts N] [--padding N]\n  --grid-res N          SDF grid resolution (default: 64)\n  --decomp-res N        VHACD voxel resolution (default: min(grid-res, 128))\n  --decomp-concavity X  VHACD concavity threshold; lower values usually produce more parts (default: 0.002)\n  --max-parts N         Upper bound on VHACD convex parts (default: 128)"
                 );
                 return Ok(());
             }
@@ -58,9 +72,6 @@ fn main() -> Result<()> {
     let output = output.context("missing output directory; use --help for usage")?;
     println!("Processing {} -> {}", input.display(), output.display());
     mesh_to_assembly(&input, &output, opts)?;
-    println!(
-        "Wrote assembly to {}",
-        output.join("assembly.json").display()
-    );
+    println!("Wrote assembly and convex parts to {}", output.display());
     Ok(())
 }
